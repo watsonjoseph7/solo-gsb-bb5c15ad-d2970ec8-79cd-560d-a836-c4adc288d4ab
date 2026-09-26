@@ -40,6 +40,12 @@ class AckIn(BaseModel):
     lease_token: str = Field(..., min_length=1, max_length=255)
 
 
+class AckPrefixIn(BaseModel):
+    lease_token: str = Field(..., min_length=1, max_length=255)
+    # 不加下界约束: 超出租约区间(含 <=0)统一走 409, 而不是 422
+    through_seq: int
+
+
 class RewindIn(BaseModel):
     # 不加下界约束: 低于链锚点(含负数)统一走 409, 而不是 422
     target_seq: int = Field(...)
@@ -341,6 +347,74 @@ def ack(
         "consumer_id": consumer_id,
         "acknowledged": True,
         "cursor_seq": to_seq,
+    }
+
+
+@app.post("/consumers/{consumer_id}/ack-prefix")
+def ack_prefix(
+    consumer_id: str = Path(..., min_length=1, max_length=255),
+    req: AckPrefixIn = Body(...),
+):
+    """确认当前租约批次 [from_seq, through_seq] 的连续前缀。
+
+    仅接受未过期且与当前租约一致的 token, through_seq 必须落在
+    [lease_from_seq, lease_to_seq] 内; 校验通过后在同一写事务内把游标
+    推进到 through_seq 并清除租约, 下次 pull 从 through_seq+1 重新租用,
+    旧 token 立即作废(不能再用于 ack 或前缀确认)。
+
+    through_seq == lease_to_seq 时等同整批确认。未知 consumer、无租约、
+    token 不符(伪造/旧 token)、租约过期或序号越界一律 409 且状态不变。
+    """
+    now = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        consumer = conn.execute(
+            "SELECT cursor_seq, lease_token, lease_from_seq, lease_to_seq,"
+            " lease_expires_at FROM consumers WHERE consumer_id = ?",
+            (consumer_id,),
+        ).fetchone()
+        # 未知 consumer / 从未拉取过: 没有可确认的租约
+        if consumer is None or consumer["lease_token"] is None:
+            return lease_conflict("no active lease")
+        if consumer["lease_token"] != req.lease_token:
+            # 伪造或旧 token(旧批次过期后已被新租约取代, 或已被确认清除)
+            return lease_conflict("invalid lease token")
+        if datetime.fromisoformat(consumer["lease_expires_at"]) <= now:
+            # 租约已过期, 该批次可被重新投递, 旧 token 不得再确认
+            return lease_conflict("lease expired")
+        if req.through_seq < consumer["lease_from_seq"]:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "through_seq before batch start",
+                    "through_seq": req.through_seq,
+                    "lease_from_seq": consumer["lease_from_seq"],
+                    "lease_to_seq": consumer["lease_to_seq"],
+                },
+            )
+        if req.through_seq > consumer["lease_to_seq"]:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "through_seq beyond batch end",
+                    "through_seq": req.through_seq,
+                    "lease_from_seq": consumer["lease_from_seq"],
+                    "lease_to_seq": consumer["lease_to_seq"],
+                },
+            )
+
+        # 同一事务内: 推进游标到 through_seq 并清除原租约
+        conn.execute(
+            "UPDATE consumers SET cursor_seq = ?, lease_token = NULL,"
+            " lease_from_seq = NULL, lease_to_seq = NULL, lease_expires_at = NULL"
+            " WHERE consumer_id = ?",
+            (req.through_seq, consumer_id),
+        )
+    return {
+        "consumer_id": consumer_id,
+        "acknowledged": True,
+        "through_seq": req.through_seq,
+        "cursor_seq": req.through_seq,
     }
 
 

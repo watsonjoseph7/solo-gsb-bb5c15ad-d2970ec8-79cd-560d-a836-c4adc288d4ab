@@ -125,7 +125,7 @@ curl -X POST http://localhost:8000/consumers/worker-1/ack \
 - 租约**已过期**(过期批次可重投,旧 token 不得再确认);
 - 当前没有租约(从未拉取、已确认完毕、或上次拉取是空批次),包括未知 consumer。
 
-游标只能随整批确认前移,因此**禁止越序确认**:批次内的任何一条都无法被单独跳过或提前确认。
+游标只能经由确认前移(整批 `ack`,或前缀 `ack-prefix`),因此**禁止越序确认**:批次内的任何一条都无法被单独跳过或提前确认。需要处理到一半先确认一部分时,见下一节的前缀确认。
 
 一个典型的拉取-确认循环:
 
@@ -140,7 +140,52 @@ curl -X POST http://localhost:8000/consumers/worker-1/ack \
   -H 'Content-Type: application/json' -d "{\"lease_token\":\"$TOKEN\"}"
 ```
 
-### 7. 消费游标:回退重投
+### 7. 消费游标:确认连续前缀
+
+处理到批次中途、希望先确认已完成的部分时,可在**当前未过期租约**内确认从批次起点 `lease_from_seq` 到 `through_seq` 的连续前缀:
+
+```bash
+curl -X POST http://localhost:8000/consumers/worker-1/ack-prefix \
+  -H 'Content-Type: application/json' \
+  -d '{"lease_token":"NcueAr-DjIE5Cjwdn0X5OiSxe9CH_XyCkya2G0vp3sk","through_seq":2}'
+```
+
+```json
+{"consumer_id": "worker-1", "acknowledged": true, "through_seq": 2, "cursor_seq": 2}
+```
+
+确认在**同一个写事务**内完成:校验通过后游标推进到 `through_seq` 并**清除原租约**,旧 token 立即作废。下一次 `pull` 会从 `through_seq + 1` 起从未确认的首条**重新租用**(换发新 token);前缀确认的 `[lease_from_seq, through_seq]` 不会再次投递。
+
+- `through_seq` 必须落在当前租约区间 `[lease_from_seq, lease_to_seq]` 内;因为前缀必须从批次起点连续,**无法跳过中间事件**单独确认后面的某一条。
+- `through_seq` 等于批次末尾 `lease_to_seq` 时**等同整批确认**,效果与 `ack` 完全一致。
+- 确认后再用同一 token 调 `ack` 或 `ack-prefix` 都会得到 **409**(租约已清除);需要继续确认剩余事件,请先重新 `pull`。
+
+以下情况一律返回 **409 且状态不变**(游标与租约均不改动):
+
+- **未知 consumer**,或当前没有租约(从未拉取、已确认完毕、或上次拉取是空批次);
+- token 与当前租约不一致(**伪造**或**旧 token**);
+- 租约**已过期**(过期批次可重投,旧 token 不得再确认);
+- `through_seq` **越界**:早于批次起点(响应 `through_seq before batch start`)或晚于批次末尾(`through_seq beyond batch end`),响应中同时给出当前租约的 `lease_from_seq`/`lease_to_seq`。
+
+```json
+{"detail": "through_seq beyond batch end", "through_seq": 9,
+ "lease_from_seq": 1, "lease_to_seq": 2}
+```
+
+典型用法:租一大批、边处理边确认前缀,租约快到期时已确认的部分不会在重投中重复出现:
+
+```bash
+# 1) 租用一批, 处理完前 50 条
+# 2) 确认连续前缀
+curl -X POST http://localhost:8000/consumers/worker-1/ack-prefix \
+  -H 'Content-Type: application/json' \
+  -d "{\"lease_token\":\"$TOKEN\",\"through_seq\":50}"
+# 3) 再次 pull: 从 seq=51 开始租用未确认事件
+curl -X POST http://localhost:8000/consumers/worker-1/pull \
+  -H 'Content-Type: application/json' -d '{"limit":100,"lease_seconds":30}'
+```
+
+### 8. 消费游标:回退重投
 
 处理逻辑出错或需要重放历史时,可把**已登记** consumer 的游标回退到 `target_seq`,下一次 `pull` 从 `target_seq + 1` 重新投递:
 
@@ -154,16 +199,16 @@ curl -X POST http://localhost:8000/consumers/worker-1/rewind \
 {"consumer_id": "worker-1", "previous_cursor_seq": 100, "cursor_seq": 42, "next_seq": 43}
 ```
 
-- **回退区间**:`target_seq` 必须落在 `[anchor_seq, cursor_seq]`(链锚点 ~ 当前游标)。低于锚点(对应事件已压缩归档、无法重投)或大于当前游标(**向前推进只能经由 `ack` 整批确认**)一律返回 **409** 且状态不变;`target_seq` 等于当前游标时为幂等空操作。
+- **回退区间**:`target_seq` 必须落在 `[anchor_seq, cursor_seq]`(链锚点 ~ 当前游标)。低于锚点(对应事件已压缩归档、无法重投)或大于当前游标(**向前推进只能经由 `ack` 整批确认或 `ack-prefix` 前缀确认**)一律返回 **409** 且状态不变;`target_seq` 等于当前游标时为幂等空操作。
 - **租约**:存在**未过期租约**时返回 **409**(回退会与在途批次冲突);**已过期租约**在同一事务内清除后再回退,旧 token 随之作废,后续 `pull` 不会重投旧批次区间。
 - **未知 consumer** 返回 **409**,不会像 `pull` 那样自动建档。
-- **并发安全**:回退与 `pull`/`ack`/`compact` 在同一写锁下串行执行,并发下只有单一结果;回退后游标不低于链锚点,`compact` 的安全边界也随之收紧,绝不会产生指向已压缩事件的租约。
+- **并发安全**:回退与 `pull`/`ack`/`ack-prefix`/`compact` 在同一写锁下串行执行,并发下只有单一结果;回退后游标不低于链锚点,`compact` 的安全边界也随之收紧,绝不会产生指向已压缩事件的租约。
 
 ```json
 {"detail": "target_seq below chain anchor", "target_seq": 3, "anchor_seq": 4}
 ```
 
-### 8. 安全归档压缩
+### 9. 安全归档压缩
 
 已确认消费的历史事件可压缩归档:物理删除 `(当前锚点, cutoff_seq]` 的连续事件前缀,并把最后一条被删记录的 `seq`/`hash` 持久化为**链锚点**,`/integrity` 之后从锚点继续校验,历史不可篡改性不受影响。
 
@@ -239,7 +284,8 @@ curl -s http://localhost:8000/integrity
 - **完整性哈希链**:每条记录引用上一条哈希,写入与链字段更新在同一事务完成(`BEGIN IMMEDIATE` 保证并发下链头一致);`GET /integrity` 全链校验。
 - **时间比较**:`occurred_at` 归一化为 UTC ISO8601 字符串存储,范围查询走字典序比较,并建有索引。
 - **消费游标与租约**:每个 consumer 一行(`consumers` 表),保存已确认游标与当前租约(token、批次起止 seq、过期时间)。`pull` 在 `BEGIN IMMEDIATE` 事务内完成"判租约 → 取批次 → 写租约",与事件写入互斥,并发重复拉取只会得到同一个租约;`ack` 仅推进整批游标并清空租约,token 不符、过期或无租约一律 409。
-- **游标回退**:`POST /consumers/{consumer_id}/rewind` 在单个 `BEGIN IMMEDIATE` 事务内完成"校验 consumer/租约/回退区间 `[anchor_seq, cursor_seq]` → 清除已过期租约 → 回退游标",与 `pull`/`ack`/`compact` 串行,并发下只有单一结果。未过期租约、低于链锚点、向前推进、未知 consumer 均 409 且状态不变;回退后游标不低于链锚点,不会产生指向已压缩事件的租约。
+- **前缀确认**:`POST /consumers/{consumer_id}/ack-prefix` 与 `ack` 共用同一套租约校验,额外要求 `through_seq` 落在 `[lease_from_seq, lease_to_seq]`;在单个 `BEGIN IMMEDIATE` 事务内把游标推进到 `through_seq` 并清除租约,旧 token 立即作废,下次 `pull` 从 `through_seq+1` 重新租用。`through_seq` 等于批次末尾即整批确认;未知 consumer、过期/伪造/旧 token、序号越界均 409 且状态不变。
+- **游标回退**:`POST /consumers/{consumer_id}/rewind` 在单个 `BEGIN IMMEDIATE` 事务内完成"校验 consumer/租约/回退区间 `[anchor_seq, cursor_seq]` → 清除已过期租约 → 回退游标",与 `pull`/`ack`/`ack-prefix`/`compact` 串行,并发下只有单一结果。未过期租约、低于链锚点、向前推进、未知 consumer 均 409 且状态不变;回退后游标不低于链锚点,不会产生指向已压缩事件的租约。
 - **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。
 - **配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`)。
 
@@ -253,6 +299,7 @@ curl -s http://localhost:8000/integrity
 | GET | `/integrity` | 从链锚点校验完整性哈希链,返回 `verified`/`checked`/`first_break`/`anchor_seq` |
 | POST | `/consumers/{consumer_id}/pull` | 按首次接收顺序拉取并原子租用未确认事件(`limit`/`lease_seconds`) |
 | POST | `/consumers/{consumer_id}/ack` | 确认当前租约批次并推进游标;过期/伪造/旧 token 返回 409 |
+| POST | `/consumers/{consumer_id}/ack-prefix` | 确认租约内 `[批次起点, through_seq]` 连续前缀并清除租约,下次 `pull` 从 `through_seq+1` 重租;`through_seq` 到批次末尾即整批确认;未知 consumer/过期/旧 token/越界序号返回 409 |
 | POST | `/consumers/{consumer_id}/rewind` | 游标回退到 `target_seq`(限 `[anchor_seq, cursor_seq]`),下次 `pull` 从 `target_seq+1` 重投;未过期租约/越界/未知 consumer 返回 409 |
 | POST | `/retention/compact` | 安全归档压缩连续事件前缀(`cutoff_seq`/`dry_run`);越界 409 并返回 `safe_through_seq` |
 | GET | `/health` | 健康检查 |
