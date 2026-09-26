@@ -40,6 +40,12 @@ class AckIn(BaseModel):
     lease_token: str = Field(..., min_length=1, max_length=255)
 
 
+class AckPrefixIn(BaseModel):
+    lease_token: str = Field(..., min_length=1, max_length=255)
+    # 不加范围约束: 越界序号统一走 409, 而不是 422
+    through_seq: int = Field(...)
+
+
 class RewindIn(BaseModel):
     # 不加下界约束: 低于链锚点(含负数)统一走 409, 而不是 422
     target_seq: int = Field(...)
@@ -203,7 +209,7 @@ def replay(req: ReplayIn):
     }
 
 
-# ---------- consumer cursor: pull / ack / rewind ----------
+# ---------- consumer cursor: pull / ack / ack-prefix / rewind ----------
 
 @app.post("/consumers/{consumer_id}/pull")
 def pull(
@@ -341,6 +347,69 @@ def ack(
         "consumer_id": consumer_id,
         "acknowledged": True,
         "cursor_seq": to_seq,
+    }
+
+
+@app.post("/consumers/{consumer_id}/ack-prefix")
+def ack_prefix(
+    consumer_id: str = Path(..., min_length=1, max_length=255),
+    req: AckPrefixIn = Body(...),
+):
+    """确认当前租约批次中从批次起点到 through_seq 的连续前缀。
+
+    - 仅接受未过期且与当前租约一致的 token; through_seq 必须落在租约区间
+      [lease_from_seq, lease_to_seq] 内, 未知 consumer、过期租约、伪造/旧
+      token、越界序号一律 409 且状态不变。
+    - 校验与推进在同一写事务内完成: 游标前进到 through_seq 并清除原租约,
+      旧 token 立即作废, 不能再用于 ack 或前缀确认。
+    - 下次 pull 从 through_seq+1(首个未确认事件)重新租用; through_seq 等于
+      批次末尾时等同整批确认。
+    """
+    now = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        consumer = conn.execute(
+            "SELECT cursor_seq, lease_token, lease_from_seq, lease_to_seq,"
+            " lease_expires_at FROM consumers WHERE consumer_id = ?",
+            (consumer_id,),
+        ).fetchone()
+        # 未知 consumer / 从未拉取过: 没有可确认的租约
+        if consumer is None or consumer["lease_token"] is None:
+            return lease_conflict("no active lease")
+        if consumer["lease_token"] != req.lease_token:
+            # 伪造或旧 token(旧批次过期后已被新租约取代)
+            return lease_conflict("invalid lease token")
+        if datetime.fromisoformat(consumer["lease_expires_at"]) <= now:
+            # 租约已过期, 该批次可被重新投递, 旧 token 不得再确认
+            return lease_conflict("lease expired")
+
+        from_seq, to_seq = consumer["lease_from_seq"], consumer["lease_to_seq"]
+        if not from_seq <= req.through_seq <= to_seq:
+            # 越界序号: 只允许确认当前租约区间内的连续前缀
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "through_seq out of lease range",
+                    "through_seq": req.through_seq,
+                    "lease_from_seq": from_seq,
+                    "lease_to_seq": to_seq,
+                },
+            )
+
+        # 同一事务内: 游标推进到 through_seq 并清除原租约(旧 token 随之作废);
+        # 下次 pull 从 through_seq+1 起重新租用剩余未确认事件
+        conn.execute(
+            "UPDATE consumers SET cursor_seq = ?, lease_token = NULL,"
+            " lease_from_seq = NULL, lease_to_seq = NULL, lease_expires_at = NULL"
+            " WHERE consumer_id = ?",
+            (req.through_seq, consumer_id),
+        )
+    return {
+        "consumer_id": consumer_id,
+        "acknowledged": True,
+        "acknowledged_through_seq": req.through_seq,
+        "cursor_seq": req.through_seq,
+        "next_seq": req.through_seq + 1,
     }
 
 
